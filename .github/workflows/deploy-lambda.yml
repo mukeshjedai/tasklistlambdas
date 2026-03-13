@@ -1,0 +1,114 @@
+# Deploy CreateMessage and SendMessage Lambdas to AWS
+# Triggers: push to main, or manual workflow_dispatch
+# Required secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ACCOUNT_ID,
+#   TASKLIST_CONNECTION_STRING, SEND_MESSAGE_LAMBDA_ARN, SCHEDULER_ROLE_ARN, SES_SOURCE_EMAIL
+
+name: Deploy Lambda to AWS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-southeast-2
+  DOTNET_VERSION: "8.0.x"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore TasklistApi.Lambdas/TasklistApi.Lambdas.csproj
+
+      - name: Build project
+        run: dotnet build TasklistApi.Lambdas/TasklistApi.Lambdas.csproj --configuration Release --no-restore
+
+      - name: Install AWS Lambda Tools
+        run: dotnet tool install -g Amazon.Lambda.Tools
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # One package for both Lambdas (same assembly, different handlers in AWS)
+      - name: Package Lambda
+        run: |
+          cd TasklistApi.Lambdas
+          dotnet lambda package --configuration Release --output-package lambda-package.zip
+
+      - name: Deploy CreateMessage Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name CreateMessage \
+            --zip-file fileb://TasklistApi.Lambdas/lambda-package.zip \
+            --region ${{ env.AWS_REGION }} || \
+          aws lambda create-function \
+            --function-name CreateMessage \
+            --runtime dotnet8 \
+            --role arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/lambda-execution-role \
+            --handler TasklistApi.Lambdas::TasklistApi.Lambdas.CreateMessageFunction::HandleAsync \
+            --zip-file fileb://TasklistApi.Lambdas/lambda-package.zip \
+            --timeout 30 \
+            --memory-size 512 \
+            --region ${{ env.AWS_REGION }} \
+            --environment "Variables={TASKLIST_CONNECTION_STRING=${{ secrets.TASKLIST_CONNECTION_STRING }},SEND_MESSAGE_LAMBDA_ARN=${{ secrets.SEND_MESSAGE_LAMBDA_ARN }},SCHEDULER_ROLE_ARN=${{ secrets.SCHEDULER_ROLE_ARN }}"
+
+      - name: Deploy SendMessage Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name SendMessage \
+            --zip-file fileb://TasklistApi.Lambdas/lambda-package.zip \
+            --region ${{ env.AWS_REGION }} || \
+          aws lambda create-function \
+            --function-name SendMessage \
+            --runtime dotnet8 \
+            --role arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/lambda-execution-role \
+            --handler TasklistApi.Lambdas::TasklistApi.Lambdas.SendMessageFunction::HandleAsync \
+            --zip-file fileb://TasklistApi.Lambdas/lambda-package.zip \
+            --timeout 60 \
+            --memory-size 512 \
+            --region ${{ env.AWS_REGION }} \
+            --environment "Variables={TASKLIST_CONNECTION_STRING=${{ secrets.TASKLIST_CONNECTION_STRING }},SES_SOURCE_EMAIL=${{ secrets.SES_SOURCE_EMAIL }}"
+
+      - name: Update Lambda environment variables
+        run: |
+          aws lambda update-function-configuration \
+            --function-name CreateMessage \
+            --environment "Variables={TASKLIST_CONNECTION_STRING=${{ secrets.TASKLIST_CONNECTION_STRING }},SEND_MESSAGE_LAMBDA_ARN=${{ secrets.SEND_MESSAGE_LAMBDA_ARN }},SCHEDULER_ROLE_ARN=${{ secrets.SCHEDULER_ROLE_ARN }}" \
+            --region ${{ env.AWS_REGION }}
+
+          aws lambda update-function-configuration \
+            --function-name SendMessage \
+            --environment "Variables={TASKLIST_CONNECTION_STRING=${{ secrets.TASKLIST_CONNECTION_STRING }},SES_SOURCE_EMAIL=${{ secrets.SES_SOURCE_EMAIL }}" \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Verify deployments
+        run: |
+          echo "CreateMessage:"
+          aws lambda get-function --function-name CreateMessage --region ${{ env.AWS_REGION }} --query 'Configuration.{LastModified:LastModified,Version:Version}'
+          echo "SendMessage:"
+          aws lambda get-function --function-name SendMessage --region ${{ env.AWS_REGION }} --query 'Configuration.{LastModified:LastModified,Version:Version}'
+
+      - name: Upload deployment artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lambda-packages
+          path: TasklistApi.Lambdas/lambda-package.zip
+          retention-days: 30
